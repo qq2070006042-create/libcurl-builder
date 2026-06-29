@@ -13,23 +13,64 @@ jobs:
       OPENSSL_VERSION: 3.3.2
       ZLIB_VERSION: 1.3.1
       ANDROID_API: '23'
+      NDK_VERSION: 26.3.11579264
     steps:
       - name: Install packages
         run: sudo apt-get update && sudo apt-get install -y build-essential perl autoconf automake libtool pkg-config
 
       - name: Prepare Android NDK
         run: |
-          echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME}" >> "$GITHUB_ENV"
-          echo "${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          set -e
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK="$ANDROID_NDK_HOME"
+          elif [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            NDK="$ANDROID_NDK_LATEST_HOME"
+          elif [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ] && [ -n "$(ls -A "$ANDROID_HOME/ndk" 2>/dev/null)" ]; then
+            NDK="$ANDROID_HOME/ndk/$(ls "$ANDROID_HOME/ndk" | sort -V | tail -n 1)"
+          else
+            SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}"
+            NDK="$SDK/ndk/${NDK_VERSION}"
+          fi
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "Using NDK: $NDK"
 
       - name: Create directories
         run: mkdir -p downloads build prefix/android-arm64 out
 
       - name: Download source archives
         run: |
-          curl -fL --retry 5 -o downloads/curl.tar.xz "https://curl.se/download/curl-${CURL_VERSION}.tar.xz"
-          curl -fL --retry 5 -o downloads/openssl.tar.gz "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
-          curl -fL --retry 5 -o downloads/zlib.tar.gz "https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz"
+          set -e
+          download_any() {
+            out="$1"
+            shift
+            rm -f "$out" "$out.tmp"
+            for url in "$@"; do
+              echo "Downloading $url"
+              if curl -fL --retry 5 --retry-delay 2 -o "$out.tmp" "$url"; then
+                mv "$out.tmp" "$out"
+                return 0
+              fi
+              rm -f "$out.tmp"
+            done
+            echo "download failed: $out" >&2
+            return 1
+          }
+          OMM="${OPENSSL_VERSION%.*}"
+          download_any downloads/curl.tar.xz \
+            "https://curl.se/download/curl-${CURL_VERSION}.tar.xz" \
+            "https://github.com/curl/curl/releases/download/curl-${CURL_VERSION//./_}/curl-${CURL_VERSION}.tar.xz"
+          download_any downloads/openssl.tar.gz \
+            "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" \
+            "https://www.openssl.org/source/old/${OMM}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          download_any downloads/zlib.tar.gz \
+            "https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz" \
+            "https://zlib.net/fossils/zlib-${ZLIB_VERSION}.tar.gz" \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
 
       - name: Extract sources
         run: |
@@ -40,7 +81,9 @@ jobs:
 
       - name: Build zlib static
         run: |
+          set -e
           cd build/zlib
+          export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           export CC=aarch64-linux-android${ANDROID_API}-clang
           CHOST=aarch64-linux-android ./configure --static --prefix="$GITHUB_WORKSPACE/prefix/android-arm64"
           make -j$(nproc)
@@ -48,14 +91,16 @@ jobs:
 
       - name: Build OpenSSL static
         run: |
+          set -e
           cd build/openssl
           export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          ./Configure android-arm64 -D__ANDROID_API__=${ANDROID_API} --prefix="$GITHUB_WORKSPACE/prefix/android-arm64" no-shared no-tests no-ui-console no-async no-dso no-engine
+          ./Configure android-arm64 -D__ANDROID_API__=${ANDROID_API} --prefix="$GITHUB_WORKSPACE/prefix/android-arm64" no-shared no-tests no-ui-console no-async no-dso
           make -j$(nproc)
           make install_sw
 
       - name: Build libcurl shared with static OpenSSL and zlib
         run: |
+          set -e
           cd build/curl
           export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           export CC=aarch64-linux-android${ANDROID_API}-clang
@@ -66,7 +111,7 @@ jobs:
           export CFLAGS="-fPIC -O2"
           export LDFLAGS="-L$GITHUB_WORKSPACE/prefix/android-arm64/lib"
           export LIBS="$GITHUB_WORKSPACE/prefix/android-arm64/lib/libssl.a $GITHUB_WORKSPACE/prefix/android-arm64/lib/libcrypto.a $GITHUB_WORKSPACE/prefix/android-arm64/lib/libz.a -ldl -lm -llog"
-          ./configure --host=aarch64-linux-android --prefix="$GITHUB_WORKSPACE/prefix/android-arm64/curl" --enable-shared --disable-static --with-openssl="$GITHUB_WORKSPACE/prefix/android-arm64" --with-zlib="$GITHUB_WORKSPACE/prefix/android-arm64" --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --without-libidn2 --without-libpsl --without-nghttp2 --without-brotli --without-zstd
+          ./configure --host=aarch64-linux-android --prefix="$GITHUB_WORKSPACE/prefix/android-arm64/curl" --enable-shared --disable-static --with-openssl="$GITHUB_WORKSPACE/prefix/android-arm64" --with-zlib="$GITHUB_WORKSPACE/prefix/android-arm64" --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --without-libidn2 --without-libpsl --without-nghttp2 --without-brotli --without-zstd --without-ca-bundle --without-ca-path
           make -j$(nproc)
           make install
           cp "$GITHUB_WORKSPACE"/prefix/android-arm64/curl/lib/libcurl.so "$GITHUB_WORKSPACE/out/libcurl-arm64-v8a-single.so"
@@ -74,6 +119,7 @@ jobs:
 
       - name: Verify result
         run: |
+          set -e
           readelf -h out/libcurl-arm64-v8a-single.so | tee out/ELF_HEADER.txt
           readelf -d out/libcurl-arm64-v8a-single.so | tee out/NEEDED.txt
           ! grep -E 'libssl|libcrypto|libz|libnghttp2|brotli|zstd|idn2|psl|cares' out/NEEDED.txt
