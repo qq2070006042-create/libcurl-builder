@@ -1,0 +1,1 @@
+trigger Android arm64 single libcurl build
